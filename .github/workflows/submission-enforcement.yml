@@ -8,10 +8,10 @@ name: Submission Enforcement
 #   PR opened/reopened      → classify with Claude → if resource submission → cooldown violation
 #
 # Cooldown state stored in a private ops repo as cooldown-state.json.
-# Requires ACC_OPS secret (fine-grained PAT with contents:rw on ops repo).
-# Violations: missing form label, repo too young, submitting during cooldown,
-# submitting resource as PR. Level 6 = permanent ban.
-# Exponential backoff: 24h * 2^level.
+# Requires ACC_OPS secret (fine-grained PAT) with:
+#   - awesome-claude-code-ops: Contents read/write
+#   - awesome-claude-code: Issues + Pull requests read/write
+# because we use a single token for BOTH repos in the enforcement step.
 
 on:
   issues:
@@ -19,8 +19,6 @@ on:
   pull_request_target:
     types: [opened, reopened]
 
-# Per-user concurrency: different users run in parallel, same user queues.
-# Optimistic locking on the ops repo file handles any remaining races.
 concurrency:
   group: >-
     cooldown-${{
@@ -36,9 +34,6 @@ env:
   OPS_PATH: cooldown-state.json
 
 jobs:
-  # ----------------------------------------------------------
-  # Job 1: Enforce cooldown rules (skipped on issue edits)
-  # ----------------------------------------------------------
   enforce-cooldown:
     runs-on: ubuntu-latest
     if: github.event.action != 'edited'
@@ -46,13 +41,11 @@ jobs:
       allowed: ${{ steps.enforce.outputs.allowed }}
 
     permissions:
+      # These are for GITHUB_TOKEN only; our step uses ACC_OPS PAT explicitly.
       issues: write
       pull-requests: write
 
     steps:
-      # ----------------------------------------------------------
-      # 1. For PRs: get changed files for classification
-      # ----------------------------------------------------------
       - name: Get PR changed files
         id: files
         if: github.event_name == 'pull_request_target'
@@ -68,9 +61,6 @@ jobs:
             return files.data.map(f => f.filename).join('\n');
           result-encoding: string
 
-      # ----------------------------------------------------------
-      # 2. For PRs: classify with Claude
-      # ----------------------------------------------------------
       - name: Classify PR with Claude
         id: classify
         if: github.event_name == 'pull_request_target'
@@ -111,7 +101,6 @@ jobs:
             exit 0
           }
 
-          # Prepend "{" (from assistant prefill) and strip any markdown fences
           RAW=$(echo "$RESPONSE" | jq -r '.content[0].text')
           TEXT="{${RAW}"
           TEXT=$(echo "$TEXT" | sed 's/^```json//;s/^```//;s/```$//' | tr -d '\n')
@@ -125,14 +114,10 @@ jobs:
           echo "classification=$CLASSIFICATION" >> "$GITHUB_OUTPUT"
           echo "confidence=$CONFIDENCE" >> "$GITHUB_OUTPUT"
 
-      # ----------------------------------------------------------
-      # 3. Main enforcement logic (handles both issues and PRs)
-      # ----------------------------------------------------------
       - name: Enforce cooldown rules
         id: enforce
         uses: actions/github-script@v7
         env:
-          OPS_TOKEN: ${{ secrets.ACC_OPS }}
           OPS_OWNER: ${{ env.OPS_OWNER }}
           OPS_REPO: ${{ env.OPS_REPO }}
           OPS_PATH: ${{ env.OPS_PATH }}
@@ -140,15 +125,9 @@ jobs:
           PR_CLASSIFICATION: ${{ steps.classify.outputs.classification || '' }}
           PR_CONFIDENCE: ${{ steps.classify.outputs.confidence || '' }}
         with:
-          # Use the built-in GITHUB_TOKEN for actions against this repo (labels/comments/closing)
-          github-token: ${{ github.token }}
+          # Single-token approach: this step uses the PAT for BOTH repos.
+          github-token: ${{ secrets.ACC_OPS }}
           script: |
-            const { getOctokit } = require('@actions/github');
-
-            // 'github' is already an authenticated Octokit for the current repo
-            // Create a separate client for the ops repo using the PAT
-            const ops = getOctokit(process.env.OPS_TOKEN);
-
             const opsOwner = process.env.OPS_OWNER;
             const opsRepo = process.env.OPS_REPO;
             const opsPath = process.env.OPS_PATH;
@@ -215,7 +194,7 @@ jobs:
             let fileSha = null;
 
             try {
-              const { data } = await ops.rest.repos.getContent({
+              const { data } = await github.rest.repos.getContent({
                 owner: opsOwner,
                 repo: opsRepo,
                 path: opsPath
@@ -234,7 +213,6 @@ jobs:
             const userState = state[author] || null;
             let stateChanged = false;
 
-            // Helper: record a violation and set cooldown
             function recordViolation(reason) {
               const level = userState ? userState.cooldown_level : 0;
 
@@ -260,7 +238,6 @@ jobs:
               stateChanged = true;
             }
 
-            // Helper: close issue or PR with comment
             async function closeWithComment(comment) {
               await github.rest.issues.createComment({
                 ...repo,
@@ -284,7 +261,6 @@ jobs:
               }
             }
 
-            // Helper: format remaining cooldown time
             function formatRemaining(activeUntilISO) {
               const remaining = new Date(activeUntilISO) - now;
               const days = Math.ceil(remaining / (1000 * 60 * 60 * 24));
@@ -293,7 +269,6 @@ jobs:
               return `${days} days`;
             }
 
-            // Helper: save state to ops repo and set output
             async function saveAndExit(allowed) {
               core.setOutput('allowed', allowed);
 
@@ -316,7 +291,7 @@ jobs:
                 };
                 if (fileSha) params.sha = fileSha;
 
-                await ops.rest.repos.createOrUpdateFileContents(params);
+                await github.rest.repos.createOrUpdateFileContents(params);
                 console.log(`State saved: ${commitMsg}`);
               } catch (e) {
                 if (e.status === 409) {
@@ -510,18 +485,9 @@ jobs:
               console.log('No GitHub URL in issue body. Skipping repo age check.');
             }
 
-            // ==========================================================
-            // No violations — allow through for validation
-            // ==========================================================
             console.log(`CLEAN: ${author} — issue #${number} allowed through.`);
             await saveAndExit('true');
 
-  # ----------------------------------------------------------
-  # Job 2: Validate submission
-  #   Runs if: cooldown allowed it (opened/reopened)
-  #         or: issue was edited (cooldown skipped)
-  #   Only for issues — PRs don't go through validation.
-  # ----------------------------------------------------------
   validate:
     needs: enforce-cooldown
     if: |
