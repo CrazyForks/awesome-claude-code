@@ -140,8 +140,15 @@ jobs:
           PR_CLASSIFICATION: ${{ steps.classify.outputs.classification || '' }}
           PR_CONFIDENCE: ${{ steps.classify.outputs.confidence || '' }}
         with:
+          # Use the built-in GITHUB_TOKEN for actions against this repo (labels/comments/closing)
+          github-token: ${{ github.token }}
           script: |
-            const ops = github.getOctokit(process.env.OPS_TOKEN);
+            const { getOctokit } = require('@actions/github');
+
+            // 'github' is already an authenticated Octokit for the current repo
+            // Create a separate client for the ops repo using the PAT
+            const ops = getOctokit(process.env.OPS_TOKEN);
+
             const opsOwner = process.env.OPS_OWNER;
             const opsRepo = process.env.OPS_REPO;
             const opsPath = process.env.OPS_PATH;
@@ -184,16 +191,13 @@ jobs:
                   });
                 }
                 console.log(
-                  `PR #${number} classified as ${classification} ` +
-                  `(${confidence}) — no enforcement needed.`
+                  `PR #${number} classified as ${classification} (${confidence}) — no enforcement needed.`
                 );
                 core.setOutput('allowed', 'false');
                 return;
               }
 
-              console.log(
-                `PR #${number} classified as resource_submission — enforcing.`
-              );
+              console.log(`PR #${number} classified as resource_submission — enforcing.`);
             }
 
             // ---- Issue: excused label bypass ----
@@ -216,9 +220,7 @@ jobs:
                 repo: opsRepo,
                 path: opsPath
               });
-              state = JSON.parse(
-                Buffer.from(data.content, 'base64').toString()
-              );
+              state = JSON.parse(Buffer.from(data.content, 'base64').toString());
               fileSha = data.sha;
               console.log(`Loaded state (sha: ${fileSha})`);
             } catch (e) {
@@ -246,9 +248,7 @@ jobs:
                 };
               } else {
                 const hours = 24 * Math.pow(2, level);
-                const activeUntil = new Date(
-                  now.getTime() + hours * 60 * 60 * 1000
-                );
+                const activeUntil = new Date(now.getTime() + hours * 60 * 60 * 1000);
                 state[author] = {
                   active_until: activeUntil.toISOString(),
                   cooldown_level: level + 1,
@@ -299,9 +299,7 @@ jobs:
 
               if (!stateChanged) return;
 
-              const content = Buffer.from(
-                JSON.stringify(state, null, 2)
-              ).toString('base64');
+              const content = Buffer.from(JSON.stringify(state, null, 2)).toString('base64');
 
               const commitMsg =
                 `cooldown: ${author} — ` +
@@ -322,11 +320,8 @@ jobs:
                 console.log(`State saved: ${commitMsg}`);
               } catch (e) {
                 if (e.status === 409) {
-                  // Optimistic lock conflict — another run wrote first.
-                  // Fail open: violation not recorded, user caught next time.
                   console.log(
-                    `Conflict writing state (409). ` +
-                    `Violation for ${author} will be caught on next submission.`
+                    `Conflict writing state (409). Violation for ${author} will be caught on next submission.`
                   );
                 } else {
                   console.log(`Error saving state: ${e.message}`);
@@ -340,10 +335,7 @@ jobs:
             if (isPR) {
               if (userState && userState.banned === true) {
                 recordViolation('submitted-as-pr');
-              } else if (
-                userState &&
-                new Date(userState.active_until) > now
-              ) {
+              } else if (userState && new Date(userState.active_until) > now) {
                 recordViolation('submitted-as-pr-during-cooldown');
               } else {
                 recordViolation('submitted-as-pr');
@@ -390,8 +382,7 @@ jobs:
               });
 
               console.log(
-                `VIOLATION (PR): ${author} — closed #${number}, ` +
-                `level → ${updated.cooldown_level}`
+                `VIOLATION (PR): ${author} — closed #${number}, level → ${updated.cooldown_level}`
               );
               await saveAndExit('false');
               return;
@@ -427,13 +418,11 @@ jobs:
                 const updated = state[author];
                 const waitTime = updated.banned
                   ? 'This restriction is now permanent.'
-                  : `Please wait at least **${formatRemaining(updated.active_until)}** ` +
-                    `before opening any more submissions.`;
+                  : `Please wait at least **${formatRemaining(updated.active_until)}** before opening any more submissions.`;
 
                 await closeWithComment(
                   `A cooldown period is currently in effect for your account. ` +
-                  `Submitting during an active cooldown extends the ` +
-                  `restriction.\n\n` +
+                  `Submitting during an active cooldown extends the restriction.\n\n` +
                   `${waitTime}\n\n` +
                   `Please review the [CONTRIBUTING guidelines](../blob/main/CONTRIBUTING.md) ` +
                   `and [pinned issues](https://github.com/${repo.owner}/${repo.repo}/issues) ` +
@@ -441,16 +430,13 @@ jobs:
                 );
 
                 console.log(
-                  `COOLDOWN: ${author} — rejected #${number}, ` +
-                  `level ${prevLevel} → ${updated.cooldown_level}`
+                  `COOLDOWN: ${author} — rejected #${number}, level ${prevLevel} → ${updated.cooldown_level}`
                 );
                 await saveAndExit('false');
                 return;
               }
 
-              console.log(
-                `${author}: cooldown expired. Checking for violations.`
-              );
+              console.log(`${author}: cooldown expired. Checking for violations.`);
             }
 
             // CHECK 3: Missing "resource-submission" label (not via form)
@@ -464,14 +450,12 @@ jobs:
                 `As noted in [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md), ` +
                 `recommendations must be submitted using the ` +
                 `[web form](https://github.com/${repo.owner}/${repo.repo}/issues/new?template=recommend-resource.yml).\n\n` +
-                `A cooldown of **${formatRemaining(updated.active_until)}** ` +
-                `has been applied. Please use the web form for your next ` +
-                `submission.`
+                `A cooldown of **${formatRemaining(updated.active_until)}** has been applied. ` +
+                `Please use the web form for your next submission.`
               );
 
               console.log(
-                `VIOLATION (no label): ${author} — rejected #${number}, ` +
-                `level → ${updated.cooldown_level}`
+                `VIOLATION (no label): ${author} — rejected #${number}, level → ${updated.cooldown_level}`
               );
               await saveAndExit('false');
               return;
@@ -506,40 +490,30 @@ jobs:
                   });
 
                   await closeWithComment(
-                    `Thanks for the recommendation! This repository is less ` +
-                    `than a week old. We ask that projects have some time in ` +
-                    `the wild before being recommended — you're welcome to ` +
-                    `re-submit after **${readyStr}**.\n\n` +
-                    `A cooldown of **${formatRemaining(updated.active_until)}** ` +
-                    `has been applied.`
+                    `Thanks for the recommendation! This repository is less than a week old. ` +
+                    `We ask that projects have some time in the wild before being recommended — ` +
+                    `you're welcome to re-submit after **${readyStr}**.\n\n` +
+                    `A cooldown of **${formatRemaining(updated.active_until)}** has been applied.`
                   );
 
                   console.log(
                     `VIOLATION (repo age): ${author} — rejected #${number}, ` +
-                    `${repoOwner}/${repoName} is ${ageDays.toFixed(1)}d old, ` +
-                    `level → ${updated.cooldown_level}`
+                    `${repoOwner}/${repoName} is ${ageDays.toFixed(1)}d old, level → ${updated.cooldown_level}`
                   );
                   await saveAndExit('false');
                   return;
                 }
               } catch (e) {
-                console.log(
-                  `Skipping repo age check for ` +
-                  `${repoOwner}/${repoName}: ${e.message}`
-                );
+                console.log(`Skipping repo age check for ${repoOwner}/${repoName}: ${e.message}`);
               }
             } else {
-              console.log(
-                'No GitHub URL in issue body. Skipping repo age check.'
-              );
+              console.log('No GitHub URL in issue body. Skipping repo age check.');
             }
 
             // ==========================================================
             // No violations — allow through for validation
             // ==========================================================
-            console.log(
-              `CLEAN: ${author} — issue #${number} allowed through.`
-            );
+            console.log(`CLEAN: ${author} — issue #${number} allowed through.`);
             await saveAndExit('true');
 
   # ----------------------------------------------------------
